@@ -1,5 +1,4 @@
-Flask
+Flask==2.0.1
 Werkzeug==2.0.2
-requests
-python-dotenv
-flask-wtf
+requests==2.26.0
+flask-wtf==1.0.0
