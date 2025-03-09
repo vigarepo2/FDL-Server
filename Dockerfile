@@ -1,12 +1,14 @@
-FROM python:3.9
+FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install aria2c for enhanced download capabilities
+# Install necessary packages
 RUN apt-get update && apt-get install -y \
     aria2 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Set specific versions to avoid compatibility issues
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -15,8 +17,7 @@ RUN mkdir -p downloads
 RUN mkdir -p downloads/temp
 
 # Copy application files
-COPY app.py .
-COPY templates.py .
+COPY . .
 
 # Set environment variables
 ENV FLASK_APP=app.py
