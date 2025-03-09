@@ -321,6 +321,11 @@ TEMPLATES = {
             gap: 5px;
         }
         
+        .download-speed {
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+        
         .progress-container {
             height: 8px;
             background-color: var(--border);
@@ -350,6 +355,12 @@ TEMPLATES = {
         
         .status-error .progress-bar {
             background-color: var(--danger-color);
+        }
+        
+        .status-cancelled .progress-bar {
+            background-color: var(--text-secondary);
+            width: 100% !important;
+            opacity: 0.5;
         }
         
         .download-actions {
@@ -545,9 +556,9 @@ TEMPLATES = {
             item.dataset.id = download.id;
             
             let progressText = '';
-            if (download.status === 'downloading' && download.size > 0) {
+            if ((download.status === 'downloading' || download.status === 'initializing') && download.size > 0) {
                 progressText = `${formatBytes(download.downloaded)} / ${formatBytes(download.size)}`;
-            } else if (download.status === 'completed' && download.size > 0) {
+            } else if (download.size > 0) {
                 progressText = formatBytes(download.size);
             }
             
@@ -559,9 +570,15 @@ TEMPLATES = {
                 statusText = `Error: ${download.error}`;
             }
             
+            // Speed display for active downloads
+            let speedDisplay = '';
+            if (download.status === 'downloading' && download.speed) {
+                speedDisplay = `<div class="download-speed">${download.speed}</div>`;
+            }
+            
             let actions = '';
             if (download.status === 'completed') {
-                actions = `<button class="btn-download" onclick="window.location.href='/downloads/${download.filename}'">Download</button>`;
+                actions = `<button class="btn-download" onclick="window.location.href='/downloads/${encodeURIComponent(download.filename)}'">Download</button>`;
             } else if (download.status === 'downloading' || download.status === 'initializing') {
                 actions = `<button class="btn-cancel" onclick="cancelDownload('${download.id}')">Cancel</button>`;
             } else if (download.status === 'error') {
@@ -576,6 +593,7 @@ TEMPLATES = {
                         <div class="download-status">${statusText}</div>
                         <div class="download-size">${progressText}</div>
                     </div>
+                    ${speedDisplay}
                 </div>
                 <div class="progress-container">
                     <div class="progress-bar" style="width: ${download.progress}%"></div>
@@ -618,12 +636,24 @@ TEMPLATES = {
         // Fetch all downloads
         function fetchDownloads() {
             fetch('/api/downloads')
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            // Redirect to login page if unauthorized
+                            window.location.href = '/login';
+                            throw new Error('Session expired. Please log in again.');
+                        }
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     updateDownloadList(data.active, data.history);
                 })
                 .catch(error => {
-                    showAlert('Failed to fetch downloads: ' + error.message);
+                    if (!error.message.includes('Session expired')) {
+                        showAlert('Failed to fetch downloads: ' + error.message);
+                    }
                 });
         }
         
@@ -637,7 +667,16 @@ TEMPLATES = {
                 method: 'POST',
                 body: formData
             })
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            window.location.href = '/login';
+                            throw new Error('Session expired. Please log in again.');
+                        }
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     if (data.success) {
                         downloadUrl.value = '';
@@ -647,7 +686,9 @@ TEMPLATES = {
                     }
                 })
                 .catch(error => {
-                    showAlert('Error adding download: ' + error.message);
+                    if (!error.message.includes('Session expired')) {
+                        showAlert('Error adding download: ' + error.message);
+                    }
                 });
         }
         
@@ -656,7 +697,16 @@ TEMPLATES = {
             fetch(`/api/download/${id}/cancel`, {
                 method: 'POST'
             })
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            window.location.href = '/login';
+                            throw new Error('Session expired. Please log in again.');
+                        }
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     if (data.success) {
                         fetchDownloads();
@@ -665,7 +715,9 @@ TEMPLATES = {
                     }
                 })
                 .catch(error => {
-                    showAlert('Error cancelling download: ' + error.message);
+                    if (!error.message.includes('Session expired')) {
+                        showAlert('Error cancelling download: ' + error.message);
+                    }
                 });
         }
         
@@ -683,7 +735,16 @@ TEMPLATES = {
             fetch('/api/downloads/clear_history', {
                 method: 'POST'
             })
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        if (response.status === 401) {
+                            window.location.href = '/login';
+                            throw new Error('Session expired. Please log in again.');
+                        }
+                        throw new Error(`HTTP error! Status: ${response.status}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     if (data.success) {
                         fetchDownloads();
@@ -692,7 +753,9 @@ TEMPLATES = {
                     }
                 })
                 .catch(error => {
-                    showAlert('Error clearing history: ' + error.message);
+                    if (!error.message.includes('Session expired')) {
+                        showAlert('Error clearing history: ' + error.message);
+                    }
                 });
         }
         
@@ -720,10 +783,10 @@ TEMPLATES = {
             window.location.href = '/logout';
         });
         
-        // Poll for download updates
+        // Poll for download updates (more frequently for active downloads)
         function pollDownloads() {
             fetchDownloads();
-            setTimeout(pollDownloads, 3000);
+            setTimeout(pollDownloads, 1500); // Update every 1.5 seconds for smoother UI updates
         }
         
         // Initial load
