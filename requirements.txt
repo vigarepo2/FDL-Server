@@ -1,0 +1,11 @@
+flask
+flask-login
+flask-sqlalchemy
+flask-wtf
+aria2p
+requests
+humanize
+psutil
+werkzeug
+flask-socketio
+bootstrap-flask
