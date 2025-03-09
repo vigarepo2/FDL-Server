@@ -1,13 +1,12 @@
 import os
-import threading
 import time
-import uuid
-import subprocess
+import threading
 import requests
+import subprocess
 import shutil
-import json
-from urllib.parse import urlparse
-from datetime import datetime
+import uuid
+from urllib.parse import urlparse, unquote
+import re
 
 class DownloadManager:
     def __init__(self, download_dir, temp_dir):
@@ -16,246 +15,307 @@ class DownloadManager:
         self.active_downloads = {}
         self.download_history = {}
         self.lock = threading.Lock()
-        os.makedirs(download_dir, exist_ok=True)
-        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Create directories if they don't exist
+        os.makedirs(self.download_dir, exist_ok=True)
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def get_filename_from_url(self, url):
+        """Extract filename from URL or response headers"""
+        try:
+            # Try to get filename from Content-Disposition header
+            response = requests.head(url, allow_redirects=True, timeout=10)
+            content_disposition = response.headers.get('Content-Disposition')
+            if content_disposition:
+                filename_match = re.search(r'filename="?([^"]+)"?', content_disposition)
+                if filename_match:
+                    return unquote(filename_match.group(1))
+            
+            # Try to get filename from URL
+            path = urlparse(url).path
+            filename = os.path.basename(path)
+            if filename:
+                return unquote(filename)
+            
+            # Default filename if all else fails
+            content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+            extension = self._get_extension_for_content_type(content_type)
+            return f"download_{uuid.uuid4().hex[:8]}{extension}"
+        except Exception:
+            # If all fails, use a random name
+            return f"download_{uuid.uuid4().hex[:8]}"
     
-    def add_download(self, url, username):
-        download_id = str(uuid.uuid4())
-        
-        parsed_url = urlparse(url)
-        filename = os.path.basename(parsed_url.path)
-        if not filename:
-            filename = f"download_{download_id}"
-        
-        temp_path = os.path.join(self.temp_dir, filename)
-        final_path = os.path.join(self.download_dir, filename)
-        
-        download_info = {
-            'id': download_id,
-            'url': url,
-            'filename': filename,
-            'temp_path': temp_path,
-            'file_path': final_path,
-            'status': 'queued',
-            'progress': 0,
-            'bytes_downloaded': 0,
-            'total_bytes': 0,
-            'speed': 0,
-            'start_time': time.time(),
-            'end_time': None,
-            'user': username
+    def _get_extension_for_content_type(self, content_type):
+        """Map content types to file extensions"""
+        content_type_map = {
+            'application/pdf': '.pdf',
+            'application/zip': '.zip',
+            'application/x-rar-compressed': '.rar',
+            'application/x-7z-compressed': '.7z',
+            'application/x-tar': '.tar',
+            'application/x-gzip': '.gz',
+            'application/x-bzip2': '.bz2',
+            'application/x-zip-compressed': '.zip',
+            'application/octet-stream': '.bin',
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'video/mp4': '.mp4',
+            'video/x-msvideo': '.avi',
+            'video/quicktime': '.mov',
+            'audio/mpeg': '.mp3',
+            'text/plain': '.txt',
+            'text/html': '.html',
+            'text/csv': '.csv',
+            'application/json': '.json',
+            'application/msword': '.doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.ms-excel': '.xls',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx'
         }
-        
+        return content_type_map.get(content_type, '')
+
+    def add_download(self, url, use_aria2=True):
+        """Add a new download job"""
         with self.lock:
-            self.active_downloads[download_id] = download_info
-            self.download_history[download_id] = download_info.copy()
-        
-        # Start download in a separate thread
-        download_thread = threading.Thread(target=self._download_worker, args=(download_id,))
-        download_thread.daemon = True
-        download_thread.start()
-        
-        return download_id
-    
-    def _download_worker(self, download_id):
-        download = self.active_downloads.get(download_id)
-        if not download:
-            return
-        
-        try:
-            # Update status to downloading
-            self._update_download_status(download_id, status='downloading')
+            download_id = str(uuid.uuid4())
+            temp_path = os.path.join(self.temp_dir, download_id)
             
-            # Try to use aria2c for downloading if available
-            if self._is_aria2c_available():
-                self._download_with_aria2c(download_id)
+            # Get filename from URL or response headers
+            filename = self.get_filename_from_url(url)
+            
+            # Make the filename safe for the filesystem
+            filename = self._sanitize_filename(filename)
+            
+            if not filename:
+                filename = f"download_{download_id[:8]}"
+            
+            final_path = os.path.join(self.download_dir, filename)
+            
+            # Create a download job
+            download_job = {
+                'id': download_id,
+                'url': url,
+                'filename': filename,
+                'start_time': time.time(),
+                'end_time': None,
+                'temp_path': temp_path,
+                'final_path': final_path,
+                'progress': 0,
+                'status': 'initializing',
+                'error': None,
+                'size': 0,
+                'downloaded': 0
+            }
+            
+            self.active_downloads[download_id] = download_job
+            
+            # Start download in a separate thread
+            if use_aria2:
+                thread = threading.Thread(target=self._download_with_aria2, args=(download_id, url, temp_path, final_path))
             else:
-                self._download_with_requests(download_id)
-                
-            # Move file from temp to download directory
-            shutil.move(download['temp_path'], download['file_path'])
+                thread = threading.Thread(target=self._download_with_requests, args=(download_id, url, temp_path, final_path))
+            thread.daemon = True
+            thread.start()
             
-            # Update status to completed
-            self._update_download_status(download_id, status='completed', progress=100)
-        except Exception as e:
-            self._update_download_status(download_id, status='failed', error=str(e))
-        finally:
-            # Clean up
-            with self.lock:
-                if download_id in self.active_downloads:
-                    del self.active_downloads[download_id]
-    
-    def _is_aria2c_available(self):
+            return download_id
+
+    def _sanitize_filename(self, filename):
+        """Make filename safe for the filesystem"""
+        # Remove invalid characters
+        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        # Remove control characters
+        filename = ''.join(c for c in filename if ord(c) >= 32)
+        # Limit length
+        if len(filename) > 255:
+            name, ext = os.path.splitext(filename)
+            filename = name[:255-len(ext)] + ext
+        return filename or "download"
+
+    def _download_with_aria2(self, download_id, url, temp_path, final_path):
+        """Download using aria2c for better performance"""
         try:
-            subprocess.run(['aria2c', '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return True
-        except:
-            return False
-    
-    def _download_with_aria2c(self, download_id):
-        download = self.active_downloads.get(download_id)
-        if not download:
-            return
-        
-        # Setup progress file
-        progress_file = os.path.join(self.temp_dir, f"{download_id}_progress.txt")
-        
-        # Prepare aria2c command
-        cmd = [
-            'aria2c', 
-            download['url'], 
-            f'--dir={self.temp_dir}',
-            f'--out={os.path.basename(download["temp_path"])}',
-            '--summary-interval=1',
-            '--file-allocation=none',
-            '--auto-file-renaming=true',
-            '--continue=true',
-            '--max-connection-per-server=16',
-        ]
-        
-        # Start aria2c process
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        
-        # Monitor progress
-        for line in process.stdout:
-            if download_id not in self.active_downloads:
-                process.terminate()
-                break
+            self.active_downloads[download_id]['status'] = 'downloading'
+            
+            # Create a directory for this download
+            os.makedirs(temp_path, exist_ok=True)
+            
+            # Build aria2c command
+            cmd = [
+                'aria2c',
+                '--max-connection-per-server=16',
+                '--min-split-size=1M',
+                '--split=10',
+                '--continue=true',
+                '--dir', temp_path,
+                '--out', os.path.basename(final_path),
+                url
+            ]
+            
+            # Start aria2c process
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+            
+            # Monitor aria2c progress
+            total_size = 0
+            downloaded = 0
+            
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
                 
-            if '[#' in line:
-                # Extract progress information
-                parts = line.strip().split()
-                for part in parts:
-                    if '%' in part:
-                        progress = float(part.replace('%', ''))
-                        self._update_download_status(download_id, progress=progress)
-                    if 'DL:' in part:
-                        speed = part.split('DL:')[1]
-                        self._update_download_status(download_id, speed=speed)
-        
-        # Check if process completed successfully
-        if process.wait() != 0 and download_id in self.active_downloads:
-            raise Exception(f"aria2c download failed with exit code {process.returncode}")
-    
-    def _download_with_requests(self, download_id):
-        download = self.active_downloads.get(download_id)
-        if not download:
-            return
-        
-        with requests.get(download['url'], stream=True) as response:
+                # Parse progress information
+                if '(' in line and ')' in line and '%' in line:
+                    try:
+                        # Extract percentage
+                        percent_match = re.search(r'(\d+)%', line)
+                        if percent_match:
+                            progress = int(percent_match.group(1))
+                            self.active_downloads[download_id]['progress'] = progress
+                        
+                        # Extract downloaded/total
+                        size_match = re.search(r'\((\d+\.?\d*)([KMGT]?i?B)\/(\d+\.?\d*)([KMGT]?i?B)\)', line)
+                        if size_match:
+                            downloaded_str = size_match.group(1) + size_match.group(2)
+                            total_str = size_match.group(3) + size_match.group(4)
+                            
+                            downloaded = self._parse_size(downloaded_str)
+                            total_size = self._parse_size(total_str)
+                            
+                            self.active_downloads[download_id]['size'] = total_size
+                            self.active_downloads[download_id]['downloaded'] = downloaded
+                    except Exception:
+                        pass
+            
+            # Check if download was successful
+            if process.returncode == 0:
+                # Move file from temp to final location
+                temp_file = os.path.join(temp_path, os.path.basename(final_path))
+                if os.path.exists(temp_file):
+                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                    shutil.move(temp_file, final_path)
+                    
+                    self.active_downloads[download_id]['status'] = 'completed'
+                    self.active_downloads[download_id]['progress'] = 100
+                    self.active_downloads[download_id]['end_time'] = time.time()
+                    
+                    # Add to download history
+                    self.download_history[download_id] = self.active_downloads[download_id].copy()
+                else:
+                    raise Exception("Download file not found in temp directory")
+            else:
+                raise Exception(f"aria2c failed with exit code {process.returncode}")
+                
+        except Exception as e:
+            self.active_downloads[download_id]['status'] = 'error'
+            self.active_downloads[download_id]['error'] = str(e)
+            print(f"Download error: {e}")
+        finally:
+            # Clean up temp directory
+            if os.path.exists(temp_path):
+                try:
+                    shutil.rmtree(temp_path)
+                except Exception:
+                    pass
+
+    def _parse_size(self, size_str):
+        """Parse size string like 10.5MB to bytes"""
+        units = {'B': 1, 'K': 1024, 'M': 1024*1024, 'G': 1024*1024*1024, 'T': 1024*1024*1024*1024}
+        match = re.match(r'^(\d+\.?\d*)([KMGT]?i?B)$', size_str)
+        if match:
+            size, unit = match.groups()
+            unit_char = unit[0].upper() if unit else 'B'
+            return int(float(size) * units.get(unit_char, 1))
+        return 0
+
+    def _download_with_requests(self, download_id, url, temp_path, final_path):
+        """Download using requests as a fallback"""
+        try:
+            self.active_downloads[download_id]['status'] = 'downloading'
+            
+            # Create directory for temp path
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+            
+            # Start the download
+            response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
             
+            # Get file size
             total_size = int(response.headers.get('content-length', 0))
-            if total_size > 0:
-                self._update_download_status(download_id, total_bytes=total_size)
+            self.active_downloads[download_id]['size'] = total_size
             
-            downloaded_size = 0
-            start_time = time.time()
-            last_update_time = start_time
-            
-            with open(download['temp_path'], 'wb') as f:
+            # Download the file
+            downloaded = 0
+            with open(temp_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    if download_id not in self.active_downloads:
-                        # Download was cancelled
-                        break
-                    
                     if chunk:
                         f.write(chunk)
-                        downloaded_size += len(chunk)
+                        downloaded += len(chunk)
                         
-                        current_time = time.time()
-                        if current_time - last_update_time >= 0.5:  # Update every 0.5 seconds
-                            # Calculate progress
-                            progress = 0
-                            if total_size > 0:
-                                progress = (downloaded_size / total_size) * 100
-                            
-                            # Calculate speed (bytes per second)
-                            elapsed = current_time - start_time
-                            speed = downloaded_size / elapsed if elapsed > 0 else 0
-                            speed_str = f"{self._format_size(speed)}/s"
-                            
-                            self._update_download_status(
-                                download_id, 
-                                progress=progress, 
-                                bytes_downloaded=downloaded_size,
-                                speed=speed_str
-                            )
-                            last_update_time = current_time
-    
-    def _update_download_status(self, download_id, **kwargs):
-        with self.lock:
-            if download_id in self.active_downloads:
-                for key, value in kwargs.items():
-                    self.active_downloads[download_id][key] = value
-                
-                # Update end_time if status is completed or failed
-                if kwargs.get('status') in ['completed', 'failed']:
-                    self.active_downloads[download_id]['end_time'] = time.time()
-                
-                # Update history
-                self.download_history[download_id] = self.active_downloads[download_id].copy()
-    
+                        # Update progress
+                        if total_size > 0:
+                            progress = int((downloaded / total_size) * 100)
+                            self.active_downloads[download_id]['progress'] = progress
+                            self.active_downloads[download_id]['downloaded'] = downloaded
+            
+            # Move to final location
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            shutil.move(temp_path, final_path)
+            
+            self.active_downloads[download_id]['status'] = 'completed'
+            self.active_downloads[download_id]['progress'] = 100
+            self.active_downloads[download_id]['end_time'] = time.time()
+            
+            # Add to download history
+            self.download_history[download_id] = self.active_downloads[download_id].copy()
+            
+        except Exception as e:
+            self.active_downloads[download_id]['status'] = 'error'
+            self.active_downloads[download_id]['error'] = str(e)
+            print(f"Download error: {e}")
+        finally:
+            # Cleanup temp file
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
     def get_download_status(self, download_id):
+        """Get current status of a download"""
         with self.lock:
-            # First check active downloads
             if download_id in self.active_downloads:
                 return self.active_downloads[download_id]
-            # Then check history
-            if download_id in self.download_history:
+            elif download_id in self.download_history:
                 return self.download_history[download_id]
             return None
-    
+
+    def get_all_downloads(self):
+        """Get all active and completed downloads"""
+        with self.lock:
+            active = list(self.active_downloads.values())
+            history = list(self.download_history.values())
+            return {
+                'active': active,
+                'history': history
+            }
+
     def cancel_download(self, download_id):
+        """Cancel an active download"""
         with self.lock:
             if download_id in self.active_downloads:
-                # Mark as cancelled
                 self.active_downloads[download_id]['status'] = 'cancelled'
-                self.active_downloads[download_id]['end_time'] = time.time()
-                
-                # Update history
-                self.download_history[download_id] = self.active_downloads[download_id].copy()
-                
-                # Remove from active downloads
-                del self.active_downloads[download_id]
-                
-                # Try to remove temp file if it exists
-                temp_path = self.download_history[download_id]['temp_path']
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except:
-                        pass
-                
                 return True
             return False
-    
-    def get_all_active_downloads(self):
+
+    def clear_download_history(self):
+        """Clear download history"""
         with self.lock:
-            return self.active_downloads.copy()
-    
-    def get_download_history(self):
-        with self.lock:
-            return self.download_history.copy()
-    
-    def get_completed_download(self, download_id):
-        with self.lock:
-            if download_id in self.download_history and self.download_history[download_id]['status'] == 'completed':
-                return self.download_history[download_id]
-            return None
-    
-    def _format_size(self, size_bytes):
-        """Format size in bytes to human readable format"""
-        if size_bytes < 1024:
-            return f"{size_bytes:.2f}B"
-        
-        size_kb = size_bytes / 1024
-        if size_kb < 1024:
-            return f"{size_kb:.2f}KB"
-        
-        size_mb = size_kb / 1024
-        if size_mb < 1024:
-            return f"{size_mb:.2f}MB"
-        
-        size_gb = size_mb / 1024
-        return f"{size_gb:.2f}GB"
+            self.download_history.clear()
+            return True
