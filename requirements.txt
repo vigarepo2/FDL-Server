@@ -1,11 +1,5 @@
-flask
-flask-login
-flask-sqlalchemy
-flask-wtf
-aria2p
+Flask
+Werkzeug==2.0.2
 requests
-humanize
-psutil
-werkzeug
-flask-socketio
-bootstrap-flask
+python-dotenv
+flask-wtf
