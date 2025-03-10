@@ -324,6 +324,16 @@ TEMPLATES = {
         .download-speed {
             font-weight: bold;
             color: var(--primary-color);
+            font-size: 1rem;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+        }
+        
+        .download-speed::before {
+            content: "↓";
+            margin-right: 5px;
+            font-size: 1.1rem;
         }
         
         .progress-container {
@@ -570,7 +580,7 @@ TEMPLATES = {
                 statusText = `Error: ${download.error}`;
             }
             
-            // Speed display for active downloads
+            // Display download speed for active downloads
             let speedDisplay = '';
             if (download.status === 'downloading' && download.speed) {
                 speedDisplay = `<div class="download-speed">${download.speed}</div>`;
