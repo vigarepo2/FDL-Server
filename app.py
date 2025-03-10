@@ -136,8 +136,7 @@ def clear_history():
 
 @app.route('/downloads/<path:filename>')
 def download_file(filename):
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
+    # No login check here - files are publicly downloadable
     
     # Secure against path traversal attacks
     if '..' in filename or filename.startswith('/'):
@@ -145,7 +144,20 @@ def download_file(filename):
         return "Invalid filename", 400
         
     download_dir = app.config['DOWNLOAD_DIR']
-    logger.info(f"File download: {filename}")
+    logger.info(f"File download requested: {filename}")
+    
+    # Check if file exists
+    file_path = os.path.join(download_dir, filename)
+    if not os.path.isfile(file_path):
+        logger.warning(f"File not found: {filename}")
+        return "File not found", 404
+    
+    # Log the download
+    user = session.get('username', 'Anonymous')
+    ip = request.remote_addr
+    logger.info(f"File download: {filename} by {user} from {ip}")
+    
+    # Send the file as attachment
     return send_from_directory(download_dir, filename, as_attachment=True)
 
 @app.errorhandler(404)
