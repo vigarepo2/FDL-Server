@@ -6,13 +6,8 @@ import subprocess
 import shutil
 import uuid
 import signal
-import logging
 from urllib.parse import urlparse, unquote
 import re
-from tempfile import mkdtemp
-
-# Configure logging
-logger = logging.getLogger('fdl_server.download_manager')
 
 class DownloadManager:
     def __init__(self, download_dir, temp_dir):
@@ -31,9 +26,8 @@ class DownloadManager:
         try:
             os.system(f'chmod -R 777 {self.download_dir}')
             os.system(f'chmod -R 777 {self.temp_dir}')
-            logger.info(f"Set permissions on download directories")
         except Exception as e:
-            logger.error(f"Failed to set permissions: {str(e)}")
+            print(f"Failed to set permissions: {str(e)}")
 
     def get_filename_from_url(self, url):
         """Extract filename from URL or response headers"""
@@ -56,8 +50,7 @@ class DownloadManager:
             content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
             extension = self._get_extension_for_content_type(content_type)
             return f"download_{uuid.uuid4().hex[:8]}{extension}"
-        except Exception as e:
-            logger.warning(f"Failed to extract filename from URL: {str(e)}")
+        except Exception:
             # If all fails, use a random name
             return f"download_{uuid.uuid4().hex[:8]}"
     
@@ -98,7 +91,8 @@ class DownloadManager:
             download_id = str(uuid.uuid4())
             
             # Create a unique temporary directory for this download
-            temp_dir = mkdtemp(prefix=f"dl_{download_id}_", dir=self.temp_dir)
+            temp_dir = os.path.join(self.temp_dir, f"dl_{download_id}")
+            os.makedirs(temp_dir, exist_ok=True)
             os.chmod(temp_dir, 0o777)  # Ensure directory is writable
             
             # Get filename from URL or response headers
@@ -112,10 +106,6 @@ class DownloadManager:
             
             temp_path = os.path.join(temp_dir, filename)
             final_path = os.path.join(self.download_dir, filename)
-            
-            # Handle file name conflicts
-            final_path = self._get_unique_filepath(final_path)
-            filename = os.path.basename(final_path)
             
             # Create a download job
             download_job = {
@@ -131,7 +121,7 @@ class DownloadManager:
                 'error': None,
                 'size': 0,
                 'downloaded': 0,
-                'speed': '0 B/s',
+                'speed': '0 B/s',  # Add speed field
                 'temp_dir': temp_dir
             }
             
@@ -145,21 +135,7 @@ class DownloadManager:
             thread.daemon = True
             thread.start()
             
-            logger.info(f"Started download {download_id} for {url}, using {'aria2' if use_aria2 else 'requests'}")
             return download_id
-
-    def _get_unique_filepath(self, path):
-        """Get a unique filepath by adding a number suffix if file exists"""
-        if not os.path.exists(path):
-            return path
-        
-        name, ext = os.path.splitext(path)
-        counter = 1
-        
-        while os.path.exists(f"{name}_{counter}{ext}"):
-            counter += 1
-            
-        return f"{name}_{counter}{ext}"
 
     def _sanitize_filename(self, filename):
         """Make filename safe for the filesystem"""
@@ -178,13 +154,12 @@ class DownloadManager:
         try:
             with self.lock:
                 if download_id not in self.active_downloads:
-                    logger.warning(f"Download {download_id} was cancelled before starting")
                     return
                 
                 self.active_downloads[download_id]['status'] = 'downloading'
+                self.active_downloads[download_id]['speed'] = '0 B/s'  # Initialize speed
             
-            # Build aria2c command
-            output_file = os.path.basename(temp_path)
+            # Build aria2c command with enhanced output options
             cmd = [
                 'aria2c',
                 '--max-connection-per-server=16',
@@ -192,10 +167,11 @@ class DownloadManager:
                 '--split=10',
                 '--continue=true',
                 '--dir', temp_dir,
-                '--out', output_file,
-                '--summary-interval=1',
-                '--human-readable=true',
-                '--download-result=full',
+                '--out', os.path.basename(final_path),
+                '--summary-interval=1',  # Update summary every second
+                '--console-log-level=notice',  # More verbose output
+                '--human-readable=true',  # Human readable output
+                '--download-result=full',  # Detailed download result
                 url
             ]
             
@@ -229,7 +205,6 @@ class DownloadManager:
                             process.terminate()
                     except Exception:
                         pass
-                    logger.info(f"Download {download_id} cancelled")
                     return
                 
                 line = process.stdout.readline()
@@ -262,39 +237,40 @@ class DownloadManager:
                             if download_id in self.active_downloads:
                                 self.active_downloads[download_id]['size'] = total_size
                                 self.active_downloads[download_id]['downloaded'] = downloaded
-                                
-                                # Calculate download speed
-                                current_time = time.time()
-                                elapsed = current_time - last_update_time
-                                
-                                if elapsed > 1:  # Update speed every second
-                                    bytes_per_sec = (downloaded - last_downloaded) / elapsed
-                                    speed = self._format_speed(bytes_per_sec)
+                    
+                    # Extract speed information directly from aria2c output
+                    speed_match = re.search(r'(\d+\.?\d*[KMGT]?i?B/s)', line)
+                    if speed_match:
+                        speed = speed_match.group(1)
+                        with self.lock:
+                            if download_id in self.active_downloads:
+                                self.active_downloads[download_id]['speed'] = speed
+                    else:
+                        # Calculate speed if not provided by aria2c
+                        current_time = time.time()
+                        elapsed = current_time - last_update_time
+                        
+                        if elapsed >= 1 and last_downloaded > 0:
+                            bytes_per_sec = (downloaded - last_downloaded) / elapsed
+                            speed = self._format_speed(bytes_per_sec)
+                            
+                            with self.lock:
+                                if download_id in self.active_downloads:
                                     self.active_downloads[download_id]['speed'] = speed
-                                    
-                                    last_update_time = current_time
-                                    last_downloaded = downloaded
+                            
+                            last_update_time = current_time
+                            last_downloaded = downloaded
                 except Exception as e:
-                    logger.error(f"Error parsing aria2c output: {str(e)}")
+                    print(f"Error parsing aria2c output: {e}")
             
             # Check if download was successful
             if process.returncode == 0:
                 # Move file from temp to final location
-                temp_file = os.path.join(temp_dir, os.path.basename(temp_path))
-                
+                temp_file = os.path.join(temp_dir, os.path.basename(final_path))
                 if os.path.exists(temp_file):
                     os.makedirs(os.path.dirname(final_path), exist_ok=True)
-                    
-                    # Handle file conflicts - use the unique path generated earlier
-                    if os.path.exists(final_path):
-                        logger.warning(f"File already exists at {final_path}, using unique name")
-                    
-                    # Ensure target directory is writable
-                    os.chmod(os.path.dirname(final_path), 0o777)
-                    
-                    # Move the file and set permissions
                     shutil.move(temp_file, final_path)
-                    os.chmod(final_path, 0o644)  # Read permissions for everyone
+                    os.chmod(final_path, 0o644)  # Set read permissions for everyone
                     
                     with self.lock:
                         if download_id in self.active_downloads:
@@ -316,7 +292,7 @@ class DownloadManager:
                     self.active_downloads[download_id]['status'] = 'error'
                     self.active_downloads[download_id]['error'] = str(e)
                     self.active_downloads[download_id]['speed'] = '0 B/s'
-            logger.error(f"Download error for {download_id}: {str(e)}")
+            print(f"Download error: {e}")
         finally:
             # Remove from processes
             with self.lock:
@@ -324,16 +300,11 @@ class DownloadManager:
                     del self.processes[download_id]
             
             # Clean up temp directory
-            self._cleanup_temp_dir(temp_dir)
-
-    def _cleanup_temp_dir(self, temp_dir):
-        """Safely clean up temporary directory"""
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                logger.debug(f"Cleaned up temporary directory: {temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up temporary directory {temp_dir}: {str(e)}")
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
 
     def _parse_size(self, size_str):
         """Parse size string like 10.5MB to bytes"""
@@ -364,6 +335,7 @@ class DownloadManager:
                     return
                 
                 self.active_downloads[download_id]['status'] = 'downloading'
+                self.active_downloads[download_id]['speed'] = '0 B/s'  # Initialize speed
             
             # Create directory for temp path
             os.makedirs(os.path.dirname(temp_path), exist_ok=True)
@@ -390,7 +362,6 @@ class DownloadManager:
                     # Check if download was cancelled
                     with self.lock:
                         if download_id not in self.active_downloads or self.active_downloads[download_id]['status'] == 'cancelled':
-                            logger.info(f"Download {download_id} cancelled during download")
                             return
                     
                     if chunk:
@@ -409,8 +380,8 @@ class DownloadManager:
                                     self.active_downloads[download_id]['progress'] = progress
                                     self.active_downloads[download_id]['downloaded'] = downloaded
                                     
-                                    # Update speed every second
-                                    if elapsed > 1:
+                                    # Calculate and update speed
+                                    if elapsed >= 1:
                                         bytes_per_sec = (downloaded - last_downloaded) / elapsed
                                         speed = self._format_speed(bytes_per_sec)
                                         self.active_downloads[download_id]['speed'] = speed
@@ -420,15 +391,8 @@ class DownloadManager:
             
             # Move to final location
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
-            
-            # Handle file conflicts - use the unique path generated earlier
-            if os.path.exists(final_path):
-                logger.warning(f"File already exists at {final_path}, using unique name")
-            
-            # Set permissions and move file
-            os.chmod(os.path.dirname(final_path), 0o777)  # Ensure directory is writable
             shutil.move(temp_path, final_path)
-            os.chmod(final_path, 0o644)  # Read permissions for everyone
+            os.chmod(final_path, 0o644)  # Set read permissions
             
             with self.lock:
                 if download_id in self.active_downloads:
@@ -446,14 +410,14 @@ class DownloadManager:
                     self.active_downloads[download_id]['status'] = 'error'
                     self.active_downloads[download_id]['error'] = str(e)
                     self.active_downloads[download_id]['speed'] = '0 B/s'
-            logger.error(f"Download error for {download_id}: {str(e)}")
+            print(f"Download error: {e}")
         finally:
-            # Clean up temp file
+            # Cleanup temp file
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                except Exception as e:
-                    logger.error(f"Failed to remove temp file {temp_path}: {str(e)}")
+                except Exception:
+                    pass
 
     def get_download_status(self, download_id):
         """Get current status of a download"""
@@ -503,15 +467,8 @@ class DownloadManager:
                                 process.terminate()
                         except Exception:
                             process.terminate()
-                        
-                        logger.info(f"Terminated process for download {download_id}")
                     except Exception as e:
-                        logger.error(f"Failed to terminate download process {download_id}: {str(e)}")
-                
-                # Clean up temp directory
-                temp_dir = self.active_downloads[download_id].get('temp_dir')
-                if temp_dir and os.path.exists(temp_dir):
-                    self._cleanup_temp_dir(temp_dir)
+                        print(f"Failed to terminate process: {e}")
                 
                 return True
             return False
@@ -520,5 +477,4 @@ class DownloadManager:
         """Clear download history"""
         with self.lock:
             self.download_history.clear()
-            logger.info("Download history cleared")
             return True
